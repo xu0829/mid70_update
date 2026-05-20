@@ -62,6 +62,11 @@ class RoiMeasureNode(Node):
 
         self.last_warn_ns = 0
 
+        # 用于3秒内积累点云及定时发布
+        self.accumulated_roi_points = []
+        self.latest_header = None
+        self.timer = self.create_timer(3.0, self.timer_callback)
+
         self.get_logger().info(
             f'ROI measure node started. point_topic={self.point_topic}, box_topic={self.box_topic}'
         )
@@ -115,62 +120,80 @@ class RoiMeasureNode(Node):
         mask = np.all(np.abs(local_pts) <= half, axis=1)
         roi = pts[mask]
 
-        # 发布框内点云
-        roi_cloud = point_cloud2.create_cloud_xyz32(cloud_msg.header, roi.tolist())
-        self.roi_pub.publish(roi_cloud)
+        if roi.shape[0] > 0:
+            self.accumulated_roi_points.append(roi)
+        self.latest_header = cloud_msg.header
 
-        if roi.shape[0] == 0:
+    def timer_callback(self):
+        if not self.latest_header or not self.latest_box:
+            return
+
+        center = np.array([
+            self.latest_box.pose.position.x,
+            self.latest_box.pose.position.y,
+            self.latest_box.pose.position.z
+        ], dtype=np.float32)
+
+        if len(self.accumulated_roi_points) == 0:
             self.publish_text(
-                frame_id=cloud_msg.header.frame_id,
+                frame_id=self.latest_header.frame_id,
                 pos=center,
-                text='ROI: 0 points'
+                text='ROI (3s): 0 points'
             )
             return
 
-        dists = np.linalg.norm(roi, axis=1)
+        # 合并3秒内积累的所有点
+        accumulated_roi = np.vstack(self.accumulated_roi_points)
+        self.accumulated_roi_points = []  # 清空缓存，进入下一个3秒周期
+
+        # 发布累积的框内点云
+        roi_cloud = point_cloud2.create_cloud_xyz32(self.latest_header, accumulated_roi.tolist())
+        self.roi_pub.publish(roi_cloud)
+
+        dists = np.linalg.norm(accumulated_roi, axis=1)
         mean_dist = float(np.mean(dists))
         min_dist = float(np.min(dists))
-        centroid = np.mean(roi, axis=0)
+        centroid = np.mean(accumulated_roi, axis=0)
         centroid_dist = float(np.linalg.norm(centroid))
         
         mean_msg = Float32()
         mean_msg.data = mean_dist
         self.mean_pub.publish(mean_msg)
 
-        if roi.shape[0] < self.min_points:
+        if accumulated_roi.shape[0] < self.min_points:
             text = (
-                f'points: {roi.shape[0]}\n'
+                f'points(3s): {accumulated_roi.shape[0]}\n'
                 f'too few points (< {self.min_points})\n'
                 f'min: {min_dist:.3f} m\n'
                 f'centroid: {centroid_dist:.3f} m'
             )
             self.publish_text(
-                frame_id=cloud_msg.header.frame_id,
+                frame_id=self.latest_header.frame_id,
                 pos=centroid,
                 text=text
             )
             self.get_logger().info(
-                f'[TOO FEW] points={roi.shape[0]}, '
+                f'[TOO FEW] points={accumulated_roi.shape[0]}, '
                 f'min={min_dist:.3f} m, '
                 f'centroid={centroid_dist:.3f} m'
             )
             return
 
         text = (
-            f'points: {roi.shape[0]}\n'
+            f'points(3s): {accumulated_roi.shape[0]}\n'
             f'min_dist: {min_dist:.3f} m\n'
             f'mean_dist: {mean_dist:.3f} m\n'
             f'centroid_dist: {centroid_dist:.3f} m'
         )
 
         self.publish_text(
-            frame_id=cloud_msg.header.frame_id,
+            frame_id=self.latest_header.frame_id,
             pos=centroid,
             text=text
         )
 
         self.get_logger().info(
-            f'points={roi.shape[0]}, '
+            f'3s accumulated: points={accumulated_roi.shape[0]}, '
             f'min={min_dist:.3f} m, '
             f'mean={mean_dist:.3f} m, '
             f'centroid={centroid_dist:.3f} m'
